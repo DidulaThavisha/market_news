@@ -1,0 +1,38 @@
+[project]
+name = "market-news"
+version = "0.1.0"
+description = "POC: fine-tune an LLM to predict market-moving news"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26,<2.3",
+    "scipy>=1.13",
+    "pyarrow>=16",
+    "yfinance>=0.2.40",
+    "statsmodels>=0.14",
+    "scikit-learn>=1.5",
+    "transformers>=4.45",
+    "requests>=2.32",
+    "tqdm>=4.66",
+    "python-dateutil>=2.9",
+    "pytz>=2024.1",
+]
+
+# Install on the CUDA box only:
+#   uv sync --extra training
+# Unsloth's exact wheel depends on your CUDA + PyTorch combo. If `uv sync` cannot
+# resolve unsloth for your setup, follow https://github.com/unslothai/unsloth#installation
+# to install the correct wheel manually, then `uv sync --extra training --no-install-package unsloth`.
+[project.optional-dependencies]
+training = [
+    "torch>=2.3",
+    "datasets>=2.20",
+    "trl>=0.10",
+    "peft>=0.12",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.33",
+    "unsloth>=2024.8",
+]
+
+[tool.uv]
+package = false
