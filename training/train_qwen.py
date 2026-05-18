@@ -39,8 +39,7 @@ def main():
     # Imports are deferred so that running with --help on a CPU box doesn't crash.
     import torch
     from datasets import load_dataset
-    from transformers import TrainingArguments
-    from trl import SFTTrainer
+    from trl import SFTConfig, SFTTrainer
     from unsloth import FastLanguageModel
     from unsloth.chat_templates import train_on_responses_only
 
@@ -82,7 +81,7 @@ def main():
     raw = load_dataset("json", data_files=train_files)
 
     bf16_ok = torch.cuda.is_bf16_supported()
-    targs = TrainingArguments(
+    targs = SFTConfig(
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         warmup_ratio=args.warmup_ratio,
@@ -99,16 +98,16 @@ def main():
         save_strategy="epoch",
         eval_strategy="epoch" if "validation" in raw else "no",
         report_to="none",
+        dataset_text_field="text",
+        max_seq_length=args.max_seq_length,
+        packing=False,
     )
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=raw["train"],
         eval_dataset=raw.get("validation"),
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
-        packing=False,
         args=targs,
     )
 
