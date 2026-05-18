@@ -34,18 +34,29 @@ def main():
     args = ap.parse_args()
 
     import torch
+    from peft import PeftModel
     from unsloth import FastLanguageModel
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available. This script requires an NVIDIA GPU.")
 
-    print(f"Loading base + adapter: {args.base_model} + {args.adapter_dir}")
+    adapter_path = Path(args.adapter_dir)
+    if not (adapter_path / "adapter_config.json").exists():
+        raise SystemExit(
+            f"No adapter_config.json in {adapter_path}. Did training finish and "
+            f"save to {adapter_path}? Expected files: adapter_config.json, "
+            f"adapter_model.safetensors."
+        )
+
+    print(f"Loading base model: {args.base_model}")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.adapter_dir,
+        model_name=args.base_model,
         max_seq_length=2048,
         dtype=None,
         load_in_4bit=True,
     )
+    print(f"Attaching LoRA adapter: {adapter_path}")
+    model = PeftModel.from_pretrained(model, str(adapter_path))
     FastLanguageModel.for_inference(model)
 
     rows = []
