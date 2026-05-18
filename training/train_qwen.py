@@ -84,7 +84,7 @@ def main():
     raw = load_dataset("json", data_files=train_files)
 
     bf16_ok = torch.cuda.is_bf16_supported()
-    targs = SFTConfig(
+    sft_kwargs = dict(
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         warmup_ratio=args.warmup_ratio,
@@ -102,9 +102,17 @@ def main():
         eval_strategy="epoch" if "validation" in raw else "no",
         report_to="none",
         dataset_text_field="text",
-        max_seq_length=args.max_seq_length,
         packing=False,
     )
+    # TRL renamed max_seq_length -> max_length around 0.16. Pick whichever this version has.
+    sft_params = inspect.signature(SFTConfig).parameters
+    if "max_length" in sft_params:
+        sft_kwargs["max_length"] = args.max_seq_length
+    elif "max_seq_length" in sft_params:
+        sft_kwargs["max_seq_length"] = args.max_seq_length
+    else:
+        tokenizer.model_max_length = args.max_seq_length
+    targs = SFTConfig(**sft_kwargs)
 
     trainer = SFTTrainer(
         model=model,
