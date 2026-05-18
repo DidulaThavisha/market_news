@@ -37,11 +37,14 @@ def main():
     args = ap.parse_args()
 
     # Imports are deferred so that running with --help on a CPU box doesn't crash.
+    # Unsloth must be imported before transformers/trl/peft to apply its patches.
+    from unsloth import FastLanguageModel
+    from unsloth.chat_templates import train_on_responses_only
+
+    import inspect
     import torch
     from datasets import load_dataset
     from trl import SFTConfig, SFTTrainer
-    from unsloth import FastLanguageModel
-    from unsloth.chat_templates import train_on_responses_only
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available. This script requires an NVIDIA GPU.")
