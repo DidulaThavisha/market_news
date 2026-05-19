@@ -1,26 +1,20 @@
-"""Probabilistic inference for Stage 2+.
+"""Probabilistic inference for Stage 2+ (teacher-forced log-probs).
 
 Stage 1's infer.py uses greedy decode + regex parse → hard labels only. That
 forces the Spearman IC to use a coarse {-1,0,+1} proxy and makes calibration
 impossible to measure properly.
 
-This script emits full probability distributions instead:
+This script emits full probability distributions instead. For each event:
 
-  P(direction)   softmax over {down, neutral, up}
-  P(materiality) softmax over {material, immaterial} | chosen direction
+  1. Score each of {"Direction: down", "Direction: neutral", "Direction: up"}
+     as a completion of the prompt via one teacher-forced forward pass each.
+     Softmax over the three log-probs → P(direction).
+  2. Fill in the argmax direction and append "\\nMateriality: ". Score each of
+     {"material", "immaterial"} as a completion. Softmax → P(materiality).
 
-Method (per event):
-  1. Take the prompt-only chat sequence (test_prompt.jsonl row, which ends with
-     "<|im_start|>assistant\\n").
-  2. Append "Direction: ". One forward pass. Look at logits at the LAST position
-     — they predict the next token, which is the first token of the direction
-     word. Softmax over the three direction first-tokens.
-  3. Fill in the argmax direction, append "\\nMateriality: ". One forward pass.
-     Softmax over the two materiality first-tokens.
-
-Two forward passes per event. First-token softmax is an approximation when
-labels are multi-token, but our six labels tokenize unambiguously under Qwen
-BPE — verified at startup.
+Five forward passes per event. Robust to BPE re-merging at the prefix/label
+boundary (which is why we don't use a first-token softmax — Qwen's BPE merges
+trailing space + label letter together).
 
 Output schema (parquet):
   All meta fields from prompt_jsonl, plus:
@@ -45,25 +39,57 @@ DIRECTIONS = ["down", "neutral", "up"]
 MATERIALITY = ["material", "immaterial"]
 
 
-def _first_token_id(tokenizer, label: str, prefix: str) -> int:
-    """First token id of `label` when it follows `prefix`. Handles BPE merging at
-    the prefix/label boundary (the token may differ depending on what's before)."""
-    prefix_ids = tokenizer(prefix, add_special_tokens=False).input_ids
-    full_ids = tokenizer(prefix + label, add_special_tokens=False).input_ids
-    if not full_ids[: len(prefix_ids)] == prefix_ids:
-        raise SystemExit(
-            f"Tokenizer reshuffles prefix when label='{label}' is appended. "
-            f"First-token scoring would be wrong; fall back to teacher-forced log-probs."
-        )
-    return full_ids[len(prefix_ids)]
+def teacher_force_logprob(model, tokenizer, prefix_text: str, completion_text: str,
+                          max_length: int) -> float:
+    """Return log P(completion | prefix) via one forward pass on prefix + completion.
+
+    Handles BPE re-merging at the boundary by finding the longest matching prefix
+    between the standalone prefix tokenization and the joint tokenization. Tokens
+    that diverge are scored as part of the completion.
+    """
+    import torch
+
+    full_ids = tokenizer(prefix_text + completion_text, return_tensors="pt",
+                         add_special_tokens=False, truncation=True,
+                         max_length=max_length).input_ids[0]
+    prefix_ids = tokenizer(prefix_text, return_tensors="pt",
+                            add_special_tokens=False, truncation=True,
+                            max_length=max_length).input_ids[0]
+
+    upto = int(min(prefix_ids.shape[0], full_ids.shape[0]))
+    plen = 0
+    for i in range(upto):
+        if prefix_ids[i].item() != full_ids[i].item():
+            break
+        plen += 1
+
+    if plen >= int(full_ids.shape[0]):
+        return 0.0  # completion produced no new tokens; degenerate
+
+    full_ids_b = full_ids.unsqueeze(0).to("cuda")
+    with torch.inference_mode():
+        logits = model(full_ids_b).logits[0]  # [seq, vocab]
+
+    n_target = int(full_ids.shape[0]) - plen
+    target = full_ids[plen:].to("cuda")
+    pred_logits = logits[plen - 1 : plen - 1 + n_target]
+    log_probs = torch.log_softmax(pred_logits.float(), dim=-1)
+    lp = log_probs[torch.arange(n_target, device="cuda"), target].sum().item()
+    return float(lp)
+
+
+def _softmax_from_logprobs(lps: list[float]) -> list[float]:
+    import torch
+    t = torch.tensor(lps, dtype=torch.float32)
+    return torch.softmax(t, dim=0).tolist()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--adapter-dir", required=True)
-    ap.add_argument("--prompt-jsonl", required=True, help="cache/dataset_stageN/test_prompt.jsonl")
+    ap.add_argument("--prompt-jsonl", required=True)
     ap.add_argument("--base-model", default="unsloth/Qwen3-8B")
-    ap.add_argument("--out", required=True, help="output parquet")
+    ap.add_argument("--out", required=True)
     ap.add_argument("--max-seq-length", type=int, default=2048)
     args = ap.parse_args()
 
@@ -89,44 +115,33 @@ def main():
     model = PeftModel.from_pretrained(model, str(adapter_path))
     FastLanguageModel.for_inference(model)
 
-    # Direction tokens are scored at the position after "Direction: ". Materiality
-    # at the position after "\nMateriality: ". Compute once.
-    dir_token_ids = [_first_token_id(tokenizer, lab, "Direction: ") for lab in DIRECTIONS]
-    mat_token_ids = [_first_token_id(tokenizer, lab, "\nMateriality: ") for lab in MATERIALITY]
-    print(f"direction first-token ids: {dict(zip(DIRECTIONS, dir_token_ids))}")
-    print(f"materiality first-token ids: {dict(zip(MATERIALITY, mat_token_ids))}")
-
     rows = []
     with open(args.prompt_jsonl) as f:
         for line in f:
             rows.append(json.loads(line))
 
-    dir_token_t = torch.tensor(dir_token_ids, device="cuda")
-    mat_token_t = torch.tensor(mat_token_ids, device="cuda")
-
     out_records = []
     for row in tqdm(rows, desc="score"):
         base_text = row["text"]  # ends with "<|im_start|>assistant\n"
 
-        # Direction
-        dir_text = base_text + "Direction: "
-        ids = tokenizer(dir_text, return_tensors="pt", add_special_tokens=False,
-                        truncation=True, max_length=args.max_seq_length).input_ids.to("cuda")
-        with torch.inference_mode():
-            last_logits = model(ids).logits[0, -1]
-        dir_logits = last_logits[dir_token_t]
-        dir_probs = torch.softmax(dir_logits.float(), dim=0).tolist()
+        # 3 forward passes for direction.
+        dir_lps = [
+            teacher_force_logprob(model, tokenizer, base_text,
+                                  f"Direction: {lab}", args.max_seq_length)
+            for lab in DIRECTIONS
+        ]
+        dir_probs = _softmax_from_logprobs(dir_lps)
         probs_d = dict(zip(DIRECTIONS, dir_probs))
         pred_d = max(probs_d, key=probs_d.get)
 
-        # Materiality conditional on chosen direction
-        mat_text = base_text + f"Direction: {pred_d}\nMateriality: "
-        ids = tokenizer(mat_text, return_tensors="pt", add_special_tokens=False,
-                        truncation=True, max_length=args.max_seq_length).input_ids.to("cuda")
-        with torch.inference_mode():
-            last_logits = model(ids).logits[0, -1]
-        mat_logits = last_logits[mat_token_t]
-        mat_probs = torch.softmax(mat_logits.float(), dim=0).tolist()
+        # 2 forward passes for materiality, conditional on the chosen direction.
+        mat_prefix = base_text + f"Direction: {pred_d}\nMateriality: "
+        mat_lps = [
+            teacher_force_logprob(model, tokenizer, mat_prefix, lab,
+                                  args.max_seq_length)
+            for lab in MATERIALITY
+        ]
+        mat_probs = _softmax_from_logprobs(mat_lps)
         probs_m = dict(zip(MATERIALITY, mat_probs))
         pred_m = max(probs_m, key=probs_m.get)
 
