@@ -29,13 +29,15 @@ def main():
     ap.add_argument("--train-end", default="2021-01-01")
     ap.add_argument("--val-end",   default="2022-01-01")
     ap.add_argument("--test-end",  default="2023-01-01")
+    ap.add_argument("--balance", action="store_true",
+                    help="Oversample minority direction classes in train only (recommended on small datasets).")
     args = ap.parse_args()
 
     df = pd.read_parquet(args.events)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     splits = split_events(df, SplitConfig(args.train_end, args.val_end, args.test_end))
-    counts = write_splits(splits, tokenizer, Path(args.out_dir))
+    counts = write_splits(splits, tokenizer, Path(args.out_dir), balance_train=args.balance)
 
     print(json.dumps(counts, indent=2))
 

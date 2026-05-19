@@ -1,4 +1,7 @@
-"""Stage-1 eval: report metrics on the predictions parquet from training/infer.py."""
+"""Eval: report metrics on the predictions parquet (greedy infer.py or infer_probs.py).
+
+Auto-detects probabilistic outputs (Stage 2+) and includes AUC/Brier/ECE.
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,12 +14,12 @@ sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 
-from eval.metrics import overall_report, stratified_report, year_strat
+from eval.metrics import overall_report, sector_strat, stratified_report, year_strat
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--predictions", required=True, help="Parquet output of training/infer.py")
+    ap.add_argument("--predictions", required=True, help="Parquet from infer.py or infer_probs.py")
     args = ap.parse_args()
 
     df = pd.read_parquet(args.predictions)
@@ -29,6 +32,11 @@ def main():
 
     print("\n=== BY YEAR ===")
     print(json.dumps(year_strat(df), indent=2, default=str))
+
+    sector = sector_strat(df)
+    if sector is not None:
+        print("\n=== BY SECTOR ===")
+        print(json.dumps(sector, indent=2, default=str))
 
 
 if __name__ == "__main__":

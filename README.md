@@ -16,8 +16,8 @@ The full design — model choice, label engineering, biases, stage gates, exit r
 | Stage | Scope | State |
 | --- | --- | --- |
 | 0 — Infra | 1 ticker, 1 year (JPM 2019), 31 events | done |
-| 1 — Tiny pilot | 5 tickers, ~500 events | next |
-| 2 — Mid pilot | 25 tickers, ~4K events | pending |
+| 1 — Tiny pilot | 5 tickers, ~500 events | in flight (training on Kaggle CUDA) |
+| 2 — Mid pilot | 25 tickers, ~4K events | code ready |
 | 3 — Full POC | 100 tickers, ~15K events | pending |
 | 4 — Full S&P 500 | ~490 tickers, ~75K events | pending |
 
@@ -127,6 +127,43 @@ uv run python scripts/07_evaluate.py \
 Stage 1 must-prove (from the plan): direction accuracy beats majority baseline by
 ≥3pp and calibration is monotonic. Otherwise re-examine labels before scaling up.
 
+### Stage 2 — 25-ticker pilot + probabilistic outputs + backtest
+
+```bash
+# 10. Ingest + label 25 sector-diverse tickers × 2014–2024. Reuses Stage-1 cache.
+uv run python scripts/08_ingest_stage2.py
+
+# 11. Rebuild dataset JSONL on the Stage-2 events file.
+uv run python scripts/06_build_dataset.py \
+    --events cache/stage2_events_2014_2024.parquet \
+    --out-dir cache/dataset_stage2 \
+    --train-end 2023-01-01 --val-end 2024-01-01 --test-end 2025-01-01
+
+# CUDA box: train, then probabilistic inference (replaces greedy infer.py for Stage 2+).
+uv sync --extra training
+uv run --extra training python training/train_qwen.py \
+    --data-dir cache/dataset_stage2 \
+    --output-dir outputs/qwen3-8b-lora-stage2
+
+uv run --extra training python training/infer_probs.py \
+    --adapter-dir outputs/qwen3-8b-lora-stage2/final \
+    --prompt-jsonl cache/dataset_stage2/test_prompt.jsonl \
+    --out cache/predictions_stage2_test.parquet
+
+# 12. Eval with probs (auto-detected): adds AUC, Brier, ECE, sector strat.
+uv run python scripts/07_evaluate.py \
+    --predictions cache/predictions_stage2_test.parquet
+
+# 13. Event-driven backtest. Tune thresholds on val first, then quote test numbers.
+uv run python scripts/09_backtest.py \
+    --predictions cache/predictions_stage2_test.parquet \
+    --out-dir cache/backtest_stage2_test
+```
+
+Stage 2 must-prove (from the plan): per-sector IC > 0 in ≥7/11 GICS, OOT
+Spearman ≥ 0.05, gross Sharpe > 1.0. Backtest defaults (edge=0.20, material=0.50,
+1% sizing, 15 bps cost) are starting points — tune on val before quoting test.
+
 ## Repo layout
 
 ```
@@ -141,10 +178,12 @@ training/
   prompt.py         # frozen prompt template, parse_response, chat-message builders
   dataset.py        # temporal split with 7-day embargo, earnings carve-out, JSONL writer
   train_qwen.py     # Unsloth QLoRA loop (CUDA-only)
-  infer.py          # batched generation on saved adapter (CUDA-only)
+  infer.py          # Stage 1: greedy decode + regex parse → hard labels (CUDA-only)
+  infer_probs.py    # Stage 2+: first-token softmax over labels → full prob distributions
 eval/
   leakage_canary.py # text-vs-CAR[-1,0] canary; sample-size-aware verdict
-  metrics.py        # direction acc, balanced acc, macro-F1, Spearman IC, materiality AUC
+  metrics.py        # auto-detects probs; direction acc, Spearman IC, AUC, Brier, ECE
+  backtest.py       # event-driven backtest (daily-bar entry/exit, fixed costs)
 scripts/            # numbered, run in order
 cache/              # ingested + labeled parquet, dataset JSONL, predictions (gitignored)
 outputs/            # LoRA adapter checkpoints (gitignored)
@@ -154,9 +193,10 @@ docs/
 
 ## What's not built yet
 
-- Point-in-time S&P 500 membership (needed at Stage 2+ for survivorship-free expansion).
+- Point-in-time S&P 500 membership (needed at Stage 3+ for survivorship-free expansion past the curated 25-name list).
 - Earnings calendar tagging beyond Item 2.02 detection (no 8-K filed → still untagged).
-- Probabilistic outputs (current inference is greedy decode → hard labels only; Stage 2 should switch to softmax probs for proper calibration metrics).
-- Event-driven backtest engine.
+- Intraday entry/exit and the plan's σ-stop / +3σ-target rules (Stage 2 backtest uses daily bars and a fixed 10-day cap).
+- Kelly sizing + sector/position caps (Stage 2 uses equal-weight 1% per trade).
+- Borrow cost on shorts.
 
 See `docs/plan.md` for the full design and what each stage must prove.
